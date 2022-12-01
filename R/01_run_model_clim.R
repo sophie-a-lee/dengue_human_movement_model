@@ -1,8 +1,8 @@
-##############################################################
-####                                                      ####
+###############################################################
+####                                                       ####
 #### Script to fit binomial model to dengue outbreak data ####
-####                                                      ####
-##############################################################
+####                                                       ####
+###############################################################
 
 
 #### Load packages ####
@@ -13,72 +13,43 @@ sf_use_s2(F)
 
 #### Load data ####
 ## NOTE: This code will only work if 00_human_movement_collate.R has been run
-df <- fread("Data/df_full.csv")
-
-
-#### Condense data to single year ####
-df_binom <- df %>% 
-  # Convert dengue cases to incidence and outbreak indicator (DIR > 300)
-  mutate(DIR = (dengue_year/population) * 10^5,
-         outbreak = ifelse(DIR >= 300, 1, 0)) %>% 
-  group_by(municip_code_ibge, region_code, region_name, urban10,
-           level18_num, lon, lat, connect_coord1, connect_coord2) %>%
-  # Return the number of outbreaks over the time period
-  summarise(n_outbreaks = sum(outbreak),
-            n_yrs = n()) %>% 
-  ungroup() 
-
-# Save data for analysis
-fwrite(df_binom, file = "data/df_model.csv")
-
-
-#### Plot number of outbreaks on a map ####
-## NOTE: This code will only work if 00_human_movement_collate.R has been run
+df <- fread("data/df_model.csv")
 shp <- read_rds("Output/shp_parent.RDS")
 
 
-n_outbreak_map <- shp %>% 
-  full_join(., df_binom, by = "municip_code_ibge") %>% 
-  mutate(n_outbreak_na = ifelse(n_outbreaks == 0, NA, n_outbreaks)) %>% 
+#### Plot median number of months with suitable temperatures on a map ####
+median_suitable_map <- shp %>% 
+  full_join(., df, by = "municip_code_ibge") %>% 
   ggplot( ) +
-  geom_sf(aes(fill = n_outbreak_na, colour = ""), lwd = 0) +
-  scale_fill_gradient2(name = "Number of \noutbreaks", 
-                       low = "#f20089", mid = "#240046", high = "#2d00f7",
-                       midpoint = 10,
-                       # Change colour for municipalities with no outbreaks
-                       na.value = "grey") +
-  scale_colour_manual(values = NA) +
-  guides(colour = guide_legend("No outbreaks")) +
+  geom_sf(aes(fill = median_suitable), lwd = 0) +
+  scale_fill_viridis_c(name = "Months suitable",
+                       direction = -1, option = "B") +
   theme_void()
 
-
-# Save figure
-ggsave(n_outbreak_map, file = "Output/n_outbreak_map.png")
-
-
-## Count the number of municipalities with/without outbreaks by region
-addmargins(table(df_binom$region_name, df_binom$n_outbreaks))
+ggsave(median_suitable_map, file = "Output/median_suitable_map.png")
 
 
 #### Fit binomial model ####
 ## Formulate spatial smooth splines
-jagam_output <- jagam(n_outbreaks/n_yrs ~ s(lon, lat, k = 10, bs = "tp") +
+jagam_output <- jagam(n_outbreaks/n_yrs ~ median_suitable + 
+                        s(lon, lat, k = 10, bs = "tp") +
                         s(connect_coord1, connect_coord2, k = 10, bs = "tp"),
                       weights = df_binom$n_yrs,
                       file = "jagam.txt", 
-                      # Set prior for smoothing function (in this case, the lon/lat spatial smooth)
+                      # Set prior for smoothing function
                       sp.prior = "gamma", 
                       family = binomial,
                       diagonalize = F, 
-                      data = df_binom)
+                      data = df)
 
 
-# Extract basis functions to use as linear predictors in the model code
-X_dist <- jagam_output$jags.data$X[,2:10]
-X_human <- jagam_output$jags.data$X[,11:19]
+# Extract basis functions to use as linear predictors in the model
+X_clim <- jagam_output$jags.data$X[,2]
+X_dist <- jagam_output$jags.data$X[,3:11]
+X_human <- jagam_output$jags.data$X[,12:20]
 
 # Set constants for model (number obs +  number coefficients)
-Consts <- list(n = nrow(df_binom), n_yrs = df_binom$n_yrs[1], 
+Consts <- list(n = nrow(df), n_yrs = df$n_yrs[1], 
                m_dist = ncol(X_dist), 
                m_human = ncol(X_human), 
                m_tot = ncol(jagam_output$jags.data$X))
@@ -88,16 +59,16 @@ Consts <- list(n = nrow(df_binom), n_yrs = df_binom$n_yrs[1],
 Model <- nimbleCode({ 
   
   # u_dist = spatial smooth term based on distance
-  u_dist[1:n] <- X_dist[1:n, ] %*% b[2:(m_tot - m_human)] 
+  u_dist[1:n] <- X_dist[1:n, ] %*% b[3:11] 
   
   # u_human = spatial smooth term based on human movement
-  u_human[1:n] <- X_human[1:n, ] %*% b[(m_tot - m_human + 1):(m_tot)] 
+  u_human[1:n] <- X_human[1:n, ] %*% b[12:20] 
   
   for (i in 1:n) { 
     # y = number of cases
     y[i] ~ dbin(p[i], n_yrs) 
     
-    logit(p[i]) <- b[1] + u_dist[i] + u_human[i] + v[i]
+    logit(p[i]) <- b[1] + b[2] * X_clim[i] + u_dist[i] + u_human[i] + v[i]
     
     # v = iid random effect
     v[i] ~ dnorm(0, sd = sig_re)
@@ -111,6 +82,9 @@ Model <- nimbleCode({
   # Intercept
   b[1] ~ dnorm(0, sd = 5) 
   
+  # Climate coefficient
+  b[2] ~ dnorm(0, sd = 10) 
+  
   ## prior for sd(s(lon,lat))
   K1[1:(m_dist),1:(m_dist)] <- 
     S1[1:(m_dist),1:(m_dist)] * lambda[1] + 
@@ -123,11 +97,11 @@ Model <- nimbleCode({
     S2[1:m_human, (m_human + 1):(2*m_human)] * lambda[4]
   
   # Prior for smooth coefficient
-  b[2:(m_tot - m_human)] ~ dmnorm(zero[1:m_dist], 
-                                  K1[1:m_dist, 1:m_dist]) 
+  b[3:11] ~ dmnorm(zero[1:m_dist],
+                   K1[1:m_dist, 1:m_dist]) 
   
-  b[(m_tot - m_human + 1):(m_tot)] ~ dmnorm(zero[1:m_human], 
-                                            K2[1:m_human, 1:m_human]) 
+  b[12:20] ~ dmnorm(zero[1:m_human], 
+                    K2[1:m_human, 1:m_human]) 
   
   ## smoothing parameter priors 
   for (i in 1:4) {
@@ -140,9 +114,10 @@ Model <- nimbleCode({
 
 
 # Convert jagam data into data suitable for nimble
-nimbleData <- list(y = df_binom$n_outbreaks, 
+nimbleData <- list(y = df$n_outbreaks, 
                    X_dist = X_dist, 
                    X_human = X_human,
+                   X_clim = X_clim,
                    zero = jagam_output$jags.data$zero,
                    S1 = jagam_output$jags.data$S1,
                    S2 = jagam_output$jags.data$S2)
@@ -151,11 +126,11 @@ nimbleData <- list(y = df_binom$n_outbreaks,
 
 # Set initial values for MCMC
 inits <- list(b = rnorm(ncol(jagam_output$jags.data$X), sd=0.1), 
-              v =  rnorm(nrow(df_binom), 1), 
+              v =  rnorm(nrow(df), 1), 
               lambda = rep(1, 4), sig_re = .5)
 
 
-# Set up model in nimble code
+# Sets up model in nimble code
 nimbleModel <- nimbleModel(code = Model, name = 'nimbleModel', 
                            constants = Consts, data = nimbleData, 
                            inits = inits)
@@ -178,5 +153,4 @@ results <- runMCMC(compiled_model_MCMC, niter = 600000, nburnin = 200000,
 
 
 #### Save model results as RData ####
-write_rds(model_results, "Output/mcmc_results.rds")
-
+write_rds(results, "output/mcmc_results_clim.rds")

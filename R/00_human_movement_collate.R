@@ -246,3 +246,21 @@ df <- full_join(df_deng, connect_coords, by = "municip_code_ibge")
 
 ## Save full data for analysis
 fwrite(df, file = "Data/df_full.csv")
+
+
+#### Condense data to single year for models ####
+df_binom <- df %>% 
+  # Convert dengue cases to incidence and outbreak indicator (DIR > 300)
+  mutate(DIR = (dengue_year/population) * 10^5,
+         outbreak = ifelse(DIR >= 300, 1, 0)) %>% 
+  group_by(municip_code_ibge, region_code, region_name, urban10,
+           level18_num, lon, lat, connect_coord1, connect_coord2) %>%
+  # Return the number of outbreaks over the time period
+  summarise(n_outbreaks = sum(outbreak),
+            median_suitable = median(months_suitable.era),
+            n_yrs = n()) %>% 
+  ungroup() 
+
+# Save data for analysis
+fwrite(df_binom, file = "data/df_model.csv")
+
